@@ -215,5 +215,5 @@ async def stop(ctx):
     msg = await stop_audio(vc, ctx.guild.id)
     await ctx.send(msg)
 
-# -------- 啟動 Bot --------
-bot.run(os.getenv("DISCORD_TOKEN"))
+# -------------------- 啟動 Bot --------------------
+bot.run("MTQxOTM0Mjg0NzIyMzY2MDczNQ.GOPQ-Z.mWKJnoW01V7V4bGWZO1-9y48ro4Q4DavJxz6dI")
