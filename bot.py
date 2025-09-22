@@ -1,0 +1,235 @@
+import discord
+from discord.ext import commands
+import yt_dlp
+import asyncio
+import random
+import os
+from fastapi import FastAPI
+import uvicorn
+import threading
+from discord.ui import View, Button
+
+# -------------------- Discord Bot --------------------
+intents = discord.Intents.default()
+intents.message_content = True
+intents.voice_states = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+queues = {}  # key=guild.id, value=list of {"url":..., "title":...}
+current_song = {}  # key=guild.id, value=current song index
+
+# -------------------- YouTube 解析 --------------------
+def get_audio_url(query):
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'quiet': True,
+        'noplaylist': True,
+        'default_search': 'ytsearch'
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(query, download=False)
+        if 'entries' in info:
+            info = info['entries'][0]
+        return info['url'], info['title']
+
+FFMPEG_OPTIONS = {
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+    'options': '-vn'
+}
+
+# -------------------- 播放音樂 --------------------
+def play_next(vc, guild_id):
+    if guild_id not in queues or not queues[guild_id]:
+        current_song[guild_id] = None
+        return
+    if current_song[guild_id] + 1 < len(queues[guild_id]):
+        current_song[guild_id] += 1
+        song = queues[guild_id][current_song[guild_id]]
+        source = discord.FFmpegPCMAudio(song['url'], **FFMPEG_OPTIONS)
+        vc.play(source, after=lambda e: play_next(vc, guild_id))
+    else:
+        queues[guild_id] = []
+        current_song[guild_id] = None
+
+async def start_playing(guild_id):
+    guild = bot.get_guild(guild_id)
+    vc = guild.voice_client
+    if not vc or guild_id not in queues or not queues[guild_id]:
+        return
+    if vc.is_playing() or vc.is_paused():
+        return
+    song = queues[guild_id][current_song[guild_id]]
+    source = discord.FFmpegPCMAudio(song['url'], **FFMPEG_OPTIONS)
+    vc.play(source, after=lambda e: play_next(vc, guild_id))
+
+# -------------------- 語音操作 --------------------
+async def join_vc(user, guild):
+    if not user.voice or not user.voice.channel:
+        return None, "你不在語音頻道！"
+    channel = user.voice.channel
+    try:
+        if guild.voice_client:
+            await guild.voice_client.move_to(channel)
+        else:
+            await channel.connect()
+        return guild.voice_client, f"已加入 {channel.name}"
+    except Exception as e:
+        return None, f"加入語音頻道失敗: {e}"
+
+async def leave_vc(vc_client, guild_id):
+    if vc_client:
+        await vc_client.disconnect()
+        queues[guild_id] = []
+        current_song[guild_id] = None
+        return "已離開語音頻道"
+    return "我不在語音頻道！"
+
+async def stop_audio(vc_client, guild_id):
+    if vc_client and vc_client.is_playing():
+        vc_client.stop()
+        queues[guild_id] = []
+        current_song[guild_id] = None
+        return "已停止播放"
+    return "目前沒有音樂播放"
+
+async def skip_song(vc_client, guild_id):
+    if vc_client and (vc_client.is_playing() or vc_client.is_paused()):
+        vc_client.stop()
+        return "已跳到下一首"
+    return "目前沒有音樂播放"
+
+async def prev_song(vc_client, guild_id):
+    if vc_client and (vc_client.is_playing() or vc_client.is_paused()):
+        if current_song[guild_id] > 0:
+            current_song[guild_id] -= 1
+            vc_client.stop()
+            return "已跳到上一首"
+    return "目前沒有上一首歌曲"
+
+async def shuffle_queue(guild_id):
+    if guild_id in queues and queues[guild_id]:
+        random.shuffle(queues[guild_id])
+        current_song[guild_id] = 0
+        return "已隨機播放隊列"
+    return "目前隊列是空的"
+
+async def add_song(guild_id, query):
+    url, title = get_audio_url(query)
+    if guild_id not in queues:
+        queues[guild_id] = []
+        current_song[guild_id] = 0
+    queues[guild_id].append({"url": url, "title": title})
+    if current_song[guild_id] is None:
+        current_song[guild_id] = 0
+    return title
+
+# -------------------- 按鈕介面 --------------------
+class MusicControls(View):
+    def __init__(self, guild_id):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+
+    @discord.ui.button(label="播放/暫停", style=discord.ButtonStyle.primary)
+    async def play_pause(self, interaction: discord.Interaction, button: Button):
+        vc = interaction.guild.voice_client
+        if not vc or current_song.get(self.guild_id) is None:
+            await interaction.response.send_message("目前沒有音樂", ephemeral=True)
+            return
+        if vc.is_playing():
+            vc.pause()
+            await interaction.response.send_message("已暫停", ephemeral=True)
+        elif vc.is_paused():
+            vc.resume()
+            await interaction.response.send_message("已恢復播放", ephemeral=True)
+
+    @discord.ui.button(label="上一首", style=discord.ButtonStyle.secondary)
+    async def previous(self, interaction: discord.Interaction, button: Button):
+        vc = interaction.guild.voice_client
+        msg = await prev_song(vc, self.guild_id)
+        await interaction.response.send_message(msg, ephemeral=True)
+        await start_playing(self.guild_id)
+
+    @discord.ui.button(label="下一首", style=discord.ButtonStyle.success)
+    async def next(self, interaction: discord.Interaction, button: Button):
+        vc = interaction.guild.voice_client
+        msg = await skip_song(vc, self.guild_id)
+        await interaction.response.send_message(msg, ephemeral=True)
+        await start_playing(self.guild_id)
+
+    @discord.ui.button(label="停止播放", style=discord.ButtonStyle.danger)
+    async def stop_btn(self, interaction: discord.Interaction, button: Button):
+        vc = interaction.guild.voice_client
+        msg = await stop_audio(vc, self.guild_id)
+        await interaction.response.send_message(msg, ephemeral=True)
+
+    @discord.ui.button(label="清空隊列", style=discord.ButtonStyle.secondary)
+    async def clear(self, interaction: discord.Interaction, button: Button):
+        queues[self.guild_id] = []
+        current_song[self.guild_id] = None
+        await interaction.response.send_message("已清空隊列", ephemeral=True)
+
+    @discord.ui.button(label="隨機播放", style=discord.ButtonStyle.secondary)
+    async def shuffle(self, interaction: discord.Interaction, button: Button):
+        msg = await shuffle_queue(self.guild_id)
+        await interaction.response.send_message(msg, ephemeral=True)
+        await start_playing(self.guild_id)
+
+    @discord.ui.button(label="查看隊列", style=discord.ButtonStyle.secondary)
+    async def view_queue(self, interaction: discord.Interaction, button: Button):
+        if self.guild_id not in queues or not queues[self.guild_id]:
+            await interaction.response.send_message("目前隊列是空的", ephemeral=True)
+            return
+        queue_list = "\n".join(f"{i+1}. {song['title']}" for i, song in enumerate(queues[self.guild_id]))
+        await interaction.response.send_message(f"當前隊列:\n{queue_list}", ephemeral=True)
+
+# -------------------- Discord 指令 --------------------
+@bot.command()
+async def vcjoin(ctx):
+    vc, msg = await join_vc(ctx.author, ctx.guild)
+    await ctx.send(msg)
+
+@bot.command()
+async def vcleave(ctx):
+    msg = await leave_vc(ctx.guild.voice_client, ctx.guild.id)
+    await ctx.send(msg)
+
+@bot.command()
+async def play(ctx, *, query: str):
+    vc = ctx.guild.voice_client
+    if not vc:
+        await ctx.send("我還沒加入語音頻道!")
+        return
+    title = await add_song(ctx.guild.id, query)
+    view = MusicControls(ctx.guild.id)
+    await ctx.send(f"已加入隊列: {title}", view=view)
+    await start_playing(ctx.guild.id)
+
+@bot.command()
+async def queue(ctx):
+    guild_id = ctx.guild.id
+    if guild_id not in queues or not queues[guild_id]:
+        await ctx.send("目前隊列是空的")
+        return
+    queue_list = "\n".join(f"{i+1}. {song['title']}" for i, song in enumerate(queues[guild_id]))
+    await ctx.send(f"當前隊列:\n{queue_list}")
+
+@bot.command()
+async def stop(ctx):
+    vc = ctx.guild.voice_client
+    msg = await stop_audio(vc, ctx.guild.id)
+    await ctx.send(msg)
+
+# -------------------- FastAPI Web Server --------------------
+app = FastAPI()
+
+@app.get("/")
+def read_root():
+    return {"status": "Bot is running"}
+
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
+# -------------------- 啟動 --------------------
+threading.Thread(target=run_web).start()
+bot.run(os.getenv("DISCORD_TOKEN"))
